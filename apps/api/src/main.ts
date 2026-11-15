@@ -27,10 +27,13 @@ import type {
   Subtitle,
   VoiceMapping,
   VideoClip,
+  MusicAsset,
+  SubtitleStyle,
+  EpisodeEditEvent,
 } from '@podcast/types';
 import { listVoices } from './elevenlabs';
 import { ghostEditorStatus, isGhostStyle } from './ghost-editor';
-import { ensureAudioDirectory, probeVideoClip, readStoredAudio, resolveAudioPath, resolveVideoPath, storeVideoClip, storeVideoCover } from './media';
+import { ensureAudioDirectory, probeMusic, probeVideoClip, readStoredAudio, resolveAudioPath, resolveMusicPath, resolveVideoPath, storeMusicFile, storeVideoClip, storeVideoCover } from './media';
 import { mergeComposition, recoverInterruptedVideoRenders, retryFailedChunks, startGenerationBatch, startVideoRender, studioEvents, transcribe } from './jobs';
 import { id, now, readData, updateData } from './store';
 
@@ -38,6 +41,7 @@ const port = Number(process.env.PORT ?? 3001);
 const maxBodyBytes = 1_000_000;
 const maxCoverBytes = 10 * 1024 * 1024;
 const maxVideoClipBytes = 100 * 1024 * 1024;
+const maxMusicBytes = 100 * 1024 * 1024;
 const allowedOrigins = new Set((process.env.CORS_ORIGINS ?? 'http://localhost:3000,http://127.0.0.1:3000').split(','));
 const jwtSecret = process.env.SUPABASE_JWT_SECRET;
 
@@ -115,6 +119,7 @@ function publicVideoClip(clip: VideoClip): Omit<VideoClip, 'storagePath'> {
   const { storagePath: _storagePath, ...result } = clip;
   return result;
 }
+function publicMusicAsset(asset: MusicAsset): Omit<MusicAsset, 'storagePath'> { const { storagePath: _path, ...result } = asset; return result; }
 function objectBody(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'Request body must be a JSON object.', 400);
@@ -131,6 +136,18 @@ function requiredString(value: unknown, field: string, maxLength = 200): string 
 
 function optionalString(value: unknown, fallback: string, field: string, maxLength = 200): string {
   return value === undefined || value === null ? fallback : requiredString(value, field, maxLength);
+}
+
+function boundedNumber(value: unknown, fallback: number, field: string, min: number, max: number): number {
+  const result = value === undefined || value === null ? fallback : Number(value);
+  if (!Number.isFinite(result) || result < min || result > max) throw new AppError(ERROR_CODES.VALIDATION_FAILED, `${field} must be between ${min} and ${max}.`, 422);
+  return result;
+}
+
+function colorValue(value: unknown, fallback: string, field: string): string {
+  const result = optionalString(value, fallback, field, 20);
+  if (!/^#[\da-f]{6}$/i.test(result)) throw new AppError(ERROR_CODES.VALIDATION_FAILED, `${field} must be a six-digit hex color.`, 422);
+  return result;
 }
 
 function authenticate(request: IncomingMessage): Principal {
@@ -337,6 +354,43 @@ async function route(request: IncomingMessage, response: ServerResponse, princip
     sendJson(response, 201, { clip: publicVideoClip(clip) }, correlationId);
     return;
   }
+  if (parts[1] === 'video-clips' && parts.length === 3 && method === 'GET') {
+    const clip = data.videoClips.find((item) => item.id === parts[2]); if (!clip) throw new AppError(ERROR_CODES.NOT_FOUND, 'Video clip not found.', 404);
+    ownedEpisode(clip.episodeId, principal, data); const path = await resolveVideoPath(clip.storagePath); const info = await statFile(path);
+    response.writeHead(200, { 'content-type': clip.mimeType, 'content-length': info.size, 'accept-ranges': 'bytes', 'cache-control': 'private, max-age=3600' }); createReadStream(path).pipe(response); return;
+  }
+
+  if (parts[1] === 'episodes' && parts.length === 4 && parts[3] === 'music' && method === 'POST') {
+    const episode = ownedEpisode(parts[2], principal, data);
+    const mimeType = request.headers['content-type']?.split(';', 1)[0].trim().toLowerCase() ?? '';
+    const body = await readBinaryBody(request, maxMusicBytes);
+    const validMp3 = mimeType === 'audio/mpeg' && body.length > 3 && (body.toString('ascii', 0, 3) === 'ID3' || (body[0] === 0xff && (body[1] & 0xe0) === 0xe0));
+    const validMp4 = ['audio/mp4','video/mp4'].includes(mimeType) && body.length >= 12 && body.toString('ascii', 4, 8) === 'ftyp';
+    if (!validMp3 && !validMp4) throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'Music must be a valid MP3 or MP4 containing an audio track.', 415);
+    const musicId = id();
+    const storagePath = await storeMusicFile(musicId, validMp3 ? 'audio/mpeg' : 'audio/mp4', body);
+    let durationSeconds: number;
+    try { durationSeconds = await probeMusic(await resolveMusicPath(storagePath)); }
+    catch (error) { await unlink(await resolveMusicPath(storagePath)).catch(() => undefined); throw error; }
+    const asset: MusicAsset = { id: musicId, episodeId: episode.id, name: basename(url.searchParams.get('name') ?? (validMp3 ? `${musicId}.mp3` : `${musicId}.mp4`)).slice(0, 180), storagePath, mimeType: validMp3 ? 'audio/mpeg' : 'audio/mp4', format: validMp3 ? 'mp3' : 'mp4', sizeBytes: body.length, durationSeconds, status: 'READY', createdAt: now(), errorMessage: null };
+    await updateData((current) => current.musicAssets.push(asset));
+    sendJson(response, 201, { music: publicMusicAsset(asset) }, correlationId); return;
+  }
+  if (parts[1] === 'music' && parts.length === 3 && method === 'DELETE') {
+    const asset = data.musicAssets.find((item) => item.id === parts[2]);
+    if (!asset) throw new AppError(ERROR_CODES.NOT_FOUND, 'Music item not found.', 404);
+    ownedEpisode(asset.episodeId, principal, data);
+    if (data.videos.some((video) => video.status === 'PROCESSING' && video.musicTracks?.some((track) => track.musicId === asset.id))) throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'This track is being used by a video that is rendering.', 409);
+    if (data.editEvents.some((event) => event.musicAssetId === asset.id)) throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'This audio file is used by a video timeline sound effect. Remove that event before deleting the asset.', 409);
+    await updateData((current) => { current.musicAssets = current.musicAssets.filter((item) => item.id !== asset.id); current.videos = current.videos.map((video) => ({ ...video, musicTracks: (video.musicTracks ?? []).filter((track) => track.musicId !== asset.id) })); });
+    await unlink(await resolveMusicPath(asset.storagePath)).catch(() => undefined);
+    sendJson(response, 200, { deleted: true }, correlationId); return;
+  }
+  if (parts[1] === 'music' && parts.length === 4 && parts[3] === 'preview' && method === 'GET') {
+    const asset = data.musicAssets.find((item) => item.id === parts[2]); if (!asset) throw new AppError(ERROR_CODES.NOT_FOUND, 'Music item not found.', 404);
+    ownedEpisode(asset.episodeId, principal, data); const path = await resolveMusicPath(asset.storagePath); const info = await statFile(path);
+    response.writeHead(200, { 'content-type': asset.mimeType, 'content-length': info.size, 'accept-ranges': 'bytes', 'cache-control': 'private, max-age=3600' }); createReadStream(path).pipe(response); return;
+  }
 
   if (parts[1] === 'episodes' && parts.length === 3) {
     const episode = ownedEpisode(parts[2], principal, data);
@@ -357,8 +411,12 @@ async function route(request: IncomingMessage, response: ServerResponse, princip
         compositions: data.compositions.filter((composition) => composition.episodeId === episode.id),
         transcriptions: data.transcriptions.filter((transcription) => data.audios.some((audio) => audio.id === transcription.audioId && audio.episodeId === episode.id)),
         subtitles: data.subtitles.filter((subtitle) => data.transcriptions.some((transcription) => transcription.id === subtitle.transcriptionId && data.audios.some((audio) => audio.id === transcription.audioId && audio.episodeId === episode.id))),
-        videos: data.videos.filter((video) => video.episodeId === episode.id).map(publicVideo),
+        videos: data.videos.filter((video) => video.episodeId === episode.id).map((video) => ({
+          ...publicVideo(video),
+          editEvents: data.editEvents.filter((event) => event.episodeVideoId === video.id).sort((a,b) => a.startSeconds - b.startSeconds || a.orderIndex - b.orderIndex),
+        })),
         videoClips: data.videoClips.filter((clip) => clip.episodeId === episode.id).map(publicVideoClip),
+        music: data.musicAssets.filter((asset) => asset.episodeId === episode.id).map(publicMusicAsset),
       }, correlationId);
       return;
     }
@@ -531,6 +589,30 @@ async function route(request: IncomingMessage, response: ServerResponse, princip
       sendJson(response, 202, { chunkIds }, correlationId);
       return;
     }
+    if (parts.length === 4 && parts[3] === 'failed-chunks' && method === 'DELETE') {
+      const failedIds = data.chunks.filter((chunk) => chunk.batchId === batch.id && chunk.status === 'FAILED').map((chunk) => chunk.id);
+      await updateData((current) => {
+        current.chunks = current.chunks.filter((chunk) => !failedIds.includes(chunk.id));
+        const record = current.batches.find((item) => item.id === batch.id)!;
+        record.failedChunks = 0;
+        record.totalChunks = Math.max(record.completedChunks, record.totalChunks - failedIds.length);
+        if (record.failedChunks === 0 && record.completedChunks === record.totalChunks && record.status === 'FAILED') record.status = 'COMPLETED';
+      });
+      sendJson(response, 200, { deletedChunks: failedIds.length }, correlationId);
+      return;
+    }
+    if (parts.length === 3 && method === 'DELETE') {
+      const batchChunks = data.chunks.filter((chunk) => chunk.batchId === batch.id);
+      if (!batchChunks.length || batchChunks.some((chunk) => chunk.status !== 'FAILED')) {
+        throw new AppError(ERROR_CODES.CONFLICT, 'Only batches whose chunks all failed can be deleted.', 409);
+      }
+      await updateData((current) => {
+        current.chunks = current.chunks.filter((chunk) => chunk.batchId !== batch.id);
+        current.batches = current.batches.filter((item) => item.id !== batch.id);
+      });
+      sendJson(response, 200, { deletedBatchId: batch.id }, correlationId);
+      return;
+    }
   }
 
   if (parts[1] === 'audio') {
@@ -587,21 +669,27 @@ async function route(request: IncomingMessage, response: ServerResponse, princip
     if (parts.length === 4 && parts[3] === 'video' && method === 'POST') {
       if (audio.kind !== 'final') throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'Create a final composition before exporting a video.', 422);
       const mimeType = request.headers['content-type']?.split(';', 1)[0].trim().toLowerCase() ?? '';
-      const videoId = id();
+      const body = mimeType === 'application/json' ? objectBody(await readJson(request)) : null;
+      const isDraft = body?.saveAsDraft === true;
+      const requestedDraftId = typeof body?.draftId === 'string' ? body.draftId : '';
+      const existingDraft = requestedDraftId ? data.videos.find((item) => item.id === requestedDraftId && item.episodeId === audio.episodeId && item.status === 'DRAFT') : undefined;
+      if (requestedDraftId && !existingDraft) throw new AppError(ERROR_CODES.NOT_FOUND, 'Video draft was not found.', 404);
+      const videoId = existingDraft?.id ?? id();
       let video: EpisodeVideo;
+      let parsedEditEvents: EpisodeEditEvent[] = [];
       if (mimeType === 'application/json') {
-        const body = objectBody(await readJson(request));
-        const mode = body.mode;
-        const title = optionalString(body.title, 'Episode video', 'title', 120);
-        const aspectRatio = body.aspectRatio === undefined ? '16:9' : String(body.aspectRatio);
-        const resolution = body.resolution === undefined ? 720 : body.resolution;
+        const draftBody = body!;
+        const mode = draftBody.mode;
+        const title = optionalString(draftBody.title, 'Episode video', 'title', 120);
+        const aspectRatio = draftBody.aspectRatio === undefined ? '16:9' : String(draftBody.aspectRatio);
+        const resolution = draftBody.resolution === undefined ? 720 : draftBody.resolution;
         if (!['16:9', '9:16', '1:1'].includes(String(aspectRatio))) {
           throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'aspectRatio must be 16:9, 9:16, or 1:1.', 422);
         }
         if (resolution !== 720 && resolution !== 1080) {
           throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'resolution must be 720 or 1080.', 422);
         }
-        const subtitleId = typeof body.subtitleId === 'string' && body.subtitleId.trim() ? body.subtitleId.trim() : null;
+        const subtitleId = typeof draftBody.subtitleId === 'string' && draftBody.subtitleId.trim() ? draftBody.subtitleId.trim() : null;
         if (subtitleId) {
           const subtitle = data.subtitles.find((item) => item.id === subtitleId && ['srt', 'vtt'].includes(item.format));
           const transcription = subtitle && data.transcriptions.find((item) => item.id === subtitle.transcriptionId);
@@ -609,8 +697,60 @@ async function route(request: IncomingMessage, response: ServerResponse, princip
             throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'Select an SRT or VTT subtitle generated from this final audio.', 422);
           }
         }
+        const rawTracks = Array.isArray(draftBody.musicTracks) ? draftBody.musicTracks : [];
+        if (rawTracks.length > 8) throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'Choose up to 8 background music tracks.', 422);
+        const musicTracks = rawTracks.map((raw, orderIndex) => {
+          const item = objectBody(raw); const asset = data.musicAssets.find((candidate) => candidate.id === item.musicId && candidate.episodeId === audio.episodeId && candidate.status === 'READY');
+          if (!asset) throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'A selected music file is missing or unavailable.', 422);
+          const volume = Number(item.volume ?? 0.2); const requestedStartSeconds = Number(item.startSeconds ?? 0); const requestedEndSeconds = item.endSeconds == null ? null : Number(item.endSeconds); const outputStartSeconds = Number(item.outputStartSeconds ?? 0);
+          const fadeInSeconds=Number(item.fadeInSeconds??0);const fadeOutSeconds=Number(item.fadeOutSeconds??0);
+          if (![volume,requestedStartSeconds,outputStartSeconds,fadeInSeconds,fadeOutSeconds].every(Number.isFinite) || (requestedEndSeconds !== null && !Number.isFinite(requestedEndSeconds)) || volume < 0 || volume > 2 || requestedStartSeconds < 0 || outputStartSeconds < 0 || fadeInSeconds < 0 || fadeOutSeconds < 0 || fadeInSeconds > 60 || fadeOutSeconds > 60) {
+            throw new AppError(ERROR_CODES.VALIDATION_FAILED, `Music settings for "${asset.name}" contain an invalid volume or timeline value.`, 422);
+          }
+          // Clamp trims to the uploaded asset. If the saved end precedes the new
+          // start point, treat it as "play through the end" instead of failing export.
+          const startSeconds = Math.min(requestedStartSeconds, Math.max(0, asset.durationSeconds - 0.05));
+          const clampedEnd = requestedEndSeconds === null ? null : Math.min(requestedEndSeconds, asset.durationSeconds);
+          const endSeconds = clampedEnd !== null && clampedEnd > startSeconds ? clampedEnd : null;
+          return { musicId: asset.id, orderIndex, volume, startSeconds, endSeconds, outputStartSeconds, fadeInSeconds, fadeOutSeconds };
+        });
+        const voiceVolume = Number(draftBody.voiceVolume ?? 1);
+        if (!Number.isFinite(voiceVolume) || voiceVolume < 0 || voiceVolume > 2) throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'Voice volume must be between 0 and 2.', 422);
+        const rawStyle = draftBody.subtitleStyle && typeof draftBody.subtitleStyle === 'object' ? objectBody(draftBody.subtitleStyle) : {};
+        const fontFamily = optionalString(rawStyle.fontFamily, 'Arial', 'fontFamily', 80);
+        if (!['Arial','Arial Black','Verdana','Georgia','Trebuchet MS','Courier New','Segoe UI','Impact','Anton','Bebas Neue','Montserrat','Poppins','Inter','Oswald','Bangers','Playfair Display','Roboto','Archivo Black'].includes(fontFamily)) throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'Choose one of the available subtitle fonts.', 422);
+        const parsedSubtitleStyle: SubtitleStyle = {
+          animation: (['karaoke','word','fade','fade-out','pop','pop-out','bounce','typewriter','word-reveal','scale-punch','slide','shake','elastic','glitch','rotation','blur','wave','tracking','stagger','smooth','edit'].includes(String(rawStyle.animation)) ? rawStyle.animation : 'karaoke') as SubtitleStyle['animation'],
+          fontFamily, fontSize: boundedNumber(rawStyle.fontSize,52,'fontSize',12,160),
+          fontWeight: (['regular','medium','bold','extra-bold'].includes(String(rawStyle.fontWeight)) ? rawStyle.fontWeight : 'bold') as SubtitleStyle['fontWeight'],
+          textColor: colorValue(rawStyle.textColor, '#ffffff', 'textColor'), highlightColor: colorValue(rawStyle.highlightColor, '#ffe45e', 'highlightColor'),
+          alignment: (['left','center','right'].includes(String(rawStyle.alignment)) ? rawStyle.alignment : 'center') as SubtitleStyle['alignment'], position: (['top','center','bottom'].includes(String(rawStyle.position)) ? rawStyle.position : 'bottom') as SubtitleStyle['position'],
+          outlineColor: colorValue(rawStyle.outlineColor, '#000000', 'outlineColor'), outlineWidth: boundedNumber(rawStyle.outlineWidth,2,'outlineWidth',0,12), backgroundColor: colorValue(rawStyle.backgroundColor, '#000000', 'backgroundColor'), backgroundOpacity: boundedNumber(rawStyle.backgroundOpacity,0,'backgroundOpacity',0,1), shadow: boundedNumber(rawStyle.shadow,1,'shadow',0,10), lineSpacing: boundedNumber(rawStyle.lineSpacing,1,'lineSpacing',0.5,3), letterSpacing: boundedNumber(rawStyle.letterSpacing,0,'letterSpacing',-5,20),
+          preset: (['tiktok','cinematic','meme','minimal','storytelling','podcast','energetic'].includes(String(rawStyle.preset)) ? rawStyle.preset : 'podcast') as SubtitleStyle['preset'],
+          intensity: (['subtle','balanced','creative'].includes(String(rawStyle.intensity)) ? rawStyle.intensity : 'balanced') as SubtitleStyle['intensity'],
+        };
+        const subtitleStyle = draftBody.subtitleStyle && typeof draftBody.subtitleStyle === 'object' ? parsedSubtitleStyle : undefined;
+        const rawEditEvents = Array.isArray(draftBody.editEvents) ? draftBody.editEvents : [];
+        if (rawEditEvents.length > 200) throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'A video timeline can contain up to 200 edit events.', 422);
+        parsedEditEvents = rawEditEvents.map((raw, orderIndex) => {
+          const item = objectBody(raw);
+          const track = String(item.track ?? 'typography');
+          const startSeconds = Number(item.startSeconds ?? 0); const endSeconds = Number(item.endSeconds ?? 0);
+          const scale = Number(item.scale ?? 1); const opacity = Number(item.opacity ?? 1); const volume = Number(item.volume ?? 0.2);
+          if (!['typography','sticker','visual-effect','sound-effect'].includes(track) || ![startSeconds,endSeconds,scale,opacity,volume].every(Number.isFinite) || startSeconds < 0 || endSeconds <= startSeconds || endSeconds > 3600 || scale < 0.25 || scale > 4 || opacity < 0 || opacity > 1 || volume < 0 || volume > 2) {
+            throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'A timeline event has invalid track, timing, size, opacity, or volume.', 422);
+          }
+          const position = String(item.position ?? 'center');
+          if (!['top','center','bottom'].includes(position)) throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'Timeline event position must be top, center, or bottom.', 422);
+          const musicAssetId = typeof item.musicAssetId === 'string' && item.musicAssetId ? item.musicAssetId : null;
+          if (track === 'sound-effect' && !data.musicAssets.some((asset) => asset.id === musicAssetId && asset.episodeId === audio.episodeId && asset.status === 'READY')) {
+            throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'Select an uploaded audio asset for each sound effect.', 422);
+          }
+          return { id: typeof item.id === 'string' && item.id ? item.id : id(), episodeVideoId: videoId, track: track as EpisodeEditEvent['track'], startSeconds, endSeconds, text: optionalString(item.text, '', 'timeline text', 160), animation: optionalString(item.animation, 'pop', 'timeline animation', 40), position: position as EpisodeEditEvent['position'], scale, opacity, volume, enabled: item.enabled !== false, orderIndex, musicAssetId, effect: typeof item.effect === 'string' ? item.effect.slice(0, 40) : null, createdAt: now() };
+        });
+        const status = isDraft ? 'DRAFT' : 'PROCESSING';
         if (mode === 'elevenlabs') {
-          const prompt = requiredString(body.prompt, 'prompt', 1000);
+          const prompt = isDraft ? optionalString(draftBody.prompt, '', 'prompt', 1000) : requiredString(draftBody.prompt, 'prompt', 1000);
           video = {
             id: videoId,
             episodeId: audio.episodeId,
@@ -618,13 +758,14 @@ async function route(request: IncomingMessage, response: ServerResponse, princip
             title,
             aspectRatio: aspectRatio as '16:9' | '9:16' | '1:1',
             resolution,
-            status: 'PROCESSING',
+            status,
             sourceMode: 'elevenlabs',
             prompt,
             modelId: 'bytedance-seedance-v2-fast',
             generationId: null,
             clipIds: [],
             subtitleId,
+            musicTracks, voiceVolume, subtitleStyle,
             coverStoragePath: null,
             storagePath: null,
             mimeType: 'video/mp4',
@@ -634,11 +775,12 @@ async function route(request: IncomingMessage, response: ServerResponse, princip
             completedAt: null,
           };
         } else if (mode === 'uploaded' || mode === 'ghost') {
-          if (!Array.isArray(body.clipIds)) {
+          if (!Array.isArray(draftBody.clipIds) && !isDraft) {
             throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'Choose between 1 and 10 unique uploaded video clips.', 422);
           }
-          const clipIds = body.clipIds.filter((clipId): clipId is string => typeof clipId === 'string');
-          if (clipIds.length < 1 || clipIds.length > 10 || clipIds.length !== body.clipIds.length ||
+          const requestedClipIds = Array.isArray(draftBody.clipIds) ? draftBody.clipIds : [];
+          const clipIds = requestedClipIds.filter((clipId): clipId is string => typeof clipId === 'string');
+          if ((!isDraft && clipIds.length < 1) || clipIds.length > 10 || clipIds.length !== requestedClipIds.length ||
             new Set(clipIds).size !== clipIds.length) {
             throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'Choose between 1 and 10 unique uploaded video clips.', 422);
           }
@@ -647,7 +789,7 @@ async function route(request: IncomingMessage, response: ServerResponse, princip
           if (clips.some((clip) => !clip)) {
             throw new AppError(ERROR_CODES.NOT_FOUND, 'One or more selected video clips were not found in this episode.', 404);
           }
-          const ghostStyle = mode === 'ghost' ? body.ghostStyle : undefined;
+          const ghostStyle = mode === 'ghost' ? draftBody.ghostStyle : undefined;
           if (mode === 'ghost' && !isGhostStyle(ghostStyle)) {
             throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'Choose a supported Ghost Editor style.', 422);
           }
@@ -658,7 +800,7 @@ async function route(request: IncomingMessage, response: ServerResponse, princip
             title,
             aspectRatio: aspectRatio as '16:9' | '9:16' | '1:1',
             resolution,
-            status: 'PROCESSING',
+            status,
             sourceMode: mode as 'uploaded' | 'ghost',
             ghostStyle: mode === 'ghost' ? ghostStyle as string : null,
             transcriptionId: null,
@@ -667,6 +809,7 @@ async function route(request: IncomingMessage, response: ServerResponse, princip
             generationId: null,
             clipIds,
             subtitleId,
+            musicTracks, voiceVolume, subtitleStyle,
             coverStoragePath: null,
             storagePath: null,
             mimeType: 'video/mp4',
@@ -700,6 +843,7 @@ async function route(request: IncomingMessage, response: ServerResponse, princip
           status: 'PROCESSING',
           sourceMode: 'cover',
           coverStoragePath,
+          musicTracks: [], voiceVolume: 1, subtitleStyle: undefined,
           storagePath: null,
           mimeType: 'video/mp4',
           sizeBytes: 0,
@@ -708,9 +852,17 @@ async function route(request: IncomingMessage, response: ServerResponse, princip
           completedAt: null,
         };
       }
-      await updateData((current) => current.videos.push(video));
-      startVideoRender(videoId);
-      sendJson(response, 202, { video: publicVideo(video) }, correlationId);
+      if (existingDraft) video.createdAt = existingDraft.createdAt;
+      await updateData((current) => {
+        if (existingDraft) {
+          const index = current.videos.findIndex((item) => item.id === existingDraft.id);
+          current.videos[index] = video;
+        } else current.videos.push(video);
+        current.editEvents = current.editEvents.filter((event) => event.episodeVideoId !== video.id);
+        current.editEvents.push(...parsedEditEvents);
+      });
+      if (!isDraft) startVideoRender(videoId);
+      sendJson(response, isDraft ? 200 : 202, { video: publicVideo(video) }, correlationId);
       return;
     }
     if (parts.length === 3 && method === 'DELETE') {
@@ -904,11 +1056,20 @@ const server = createServer((request, response) => {
   })();
 });
 
+server.on('error', (error: NodeJS.ErrnoException) => {
+  if (error.code === 'EADDRINUSE') {
+    console.error(`Podcast API cannot listen on port ${port}: it is already in use. Stop the other API process or set PORT to a free port.`);
+  } else {
+    console.error('Podcast API server failed:', error);
+  }
+  process.exitCode = 1;
+});
+
 ensureAudioDirectory().then(recoverInterruptedVideoRenders).then(() => {
   server.listen(port, '127.0.0.1', () => {
     console.log(`Podcast API listening on http://127.0.0.1:${port}`);
   });
 }).catch((error: unknown) => {
-  console.error('Could not initialize local audio storage:', error);
+  console.error('Could not initialize Podcast API. Check Supabase migrations/schema and local media storage:', error);
   process.exitCode = 1;
 });

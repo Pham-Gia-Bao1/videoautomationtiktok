@@ -325,7 +325,7 @@ export interface Subtitle {
   createdAt: string;
 }
 
-export type VideoStatus = 'PROCESSING' | 'READY' | 'FAILED';
+export type VideoStatus = 'DRAFT' | 'PROCESSING' | 'READY' | 'FAILED';
 
 export interface EpisodeVideo {
   id: string;
@@ -350,6 +350,45 @@ export interface EpisodeVideo {
   errorMessage: string | null;
   createdAt: string;
   completedAt: string | null;
+  musicTracks?: Array<{ musicId: string; orderIndex: number; volume: number; startSeconds: number; endSeconds: number | null; outputStartSeconds: number; fadeInSeconds: number; fadeOutSeconds: number }>;
+  voiceVolume?: number;
+  subtitleStyle?: SubtitleStyle;
+}
+
+export type EpisodeEditTrack = 'typography' | 'sticker' | 'visual-effect' | 'sound-effect';
+export interface EpisodeEditEvent {
+  id: string;
+  episodeVideoId: string;
+  track: EpisodeEditTrack;
+  startSeconds: number;
+  endSeconds: number;
+  text: string;
+  animation: string;
+  position: 'top' | 'center' | 'bottom';
+  scale: number;
+  opacity: number;
+  volume: number;
+  enabled: boolean;
+  orderIndex: number;
+  musicAssetId?: string | null;
+  effect?: string | null;
+  createdAt: string;
+}
+
+export interface SubtitleStyle {
+  animation: 'karaoke' | 'word' | 'fade' | 'fade-out' | 'pop' | 'pop-out' | 'bounce' | 'typewriter' | 'word-reveal' | 'scale-punch' | 'slide' | 'shake' | 'elastic' | 'glitch' | 'rotation' | 'blur' | 'wave' | 'tracking' | 'stagger' | 'smooth' | 'edit';
+  fontFamily: string; fontSize: number; fontWeight: 'regular' | 'medium' | 'bold' | 'extra-bold';
+  textColor: string; highlightColor: string; alignment: 'left' | 'center' | 'right';
+  position: 'top' | 'center' | 'bottom'; outlineColor: string; outlineWidth: number;
+  backgroundColor: string; backgroundOpacity: number; shadow: number; lineSpacing: number; letterSpacing: number;
+  preset?: 'tiktok' | 'cinematic' | 'meme' | 'minimal' | 'storytelling' | 'podcast' | 'energetic';
+  intensity?: 'subtle' | 'balanced' | 'creative';
+}
+
+export interface MusicAsset {
+  id: string; episodeId: string; name: string; storagePath: string; mimeType: string;
+  format: 'mp3' | 'mp4'; sizeBytes: number; durationSeconds: number; status: 'READY' | 'FAILED';
+  createdAt: string; errorMessage: string | null;
 }
 
 export interface VideoClip {

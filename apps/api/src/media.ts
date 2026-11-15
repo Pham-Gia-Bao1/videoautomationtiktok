@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, extname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { ALLOWED_OUTPUT_FORMATS, AppError, ERROR_CODES } from '@podcast/core';
-import type { CompositionItem } from '@podcast/types';
+import type { CompositionItem, EpisodeEditEvent, SubtitleStyle, TranscriptionSegment } from '@podcast/types';
 import { resolveProjectPath } from './paths';
 
 const execFileAsync = promisify(execFile);
@@ -16,6 +16,7 @@ const audioRoot = process.env.AUDIO_DIR
   ? resolveProjectPath(process.env.AUDIO_DIR)
   : join(dataRoot, 'audio');
 const videoRoot = join(dataRoot, 'videos');
+const musicRoot = join(dataRoot, 'music');
 
 function safeStoredPath(relativePath: string): string {
   const path = resolve(audioRoot, relativePath);
@@ -35,6 +36,30 @@ export async function storeAudio(audioId: string, data: Buffer, format = 'mp3'):
 
 export async function resolveAudioPath(relativePath: string): Promise<string> {
   return safeStoredPath(relativePath);
+}
+
+export async function storeMusicFile(musicId: string, mimeType: string, data: Buffer): Promise<string> {
+  const ext = mimeType === 'audio/mpeg' ? 'mp3' : 'mp4';
+  const target = resolve(musicRoot, `${musicId}.${ext}`);
+  await mkdir(musicRoot, { recursive: true });
+  await writeFile(target, data, { flag: 'wx' });
+  return `${musicId}.${ext}`;
+}
+
+export async function resolveMusicPath(relativePath: string): Promise<string> {
+  const target = resolve(musicRoot, relativePath);
+  if (!target.startsWith(`${musicRoot}\\`) && !target.startsWith(`${musicRoot}/`)) throw new AppError(ERROR_CODES.FORBIDDEN, 'Invalid music storage path.', 403);
+  return target;
+}
+
+export async function probeMusic(path: string): Promise<number> {
+  try {
+    const { stdout } = await execFileAsync(process.env.FFPROBE_PATH ?? 'ffprobe', ['-v','error','-select_streams','a:0','-show_entries','format=duration:stream=codec_type','-of','json',path], { timeout: 15000, maxBuffer: 65536 });
+    const result = JSON.parse(stdout) as { format?: { duration?: string }; streams?: Array<{ codec_type?: string }> };
+    const duration = Number(result.format?.duration);
+    if (!result.streams?.some((stream) => stream.codec_type === 'audio') || !Number.isFinite(duration) || duration <= 0 || duration > 3600) throw new Error('No valid audio stream or duration.');
+    return duration;
+  } catch (error) { throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'The music file has no supported audio stream or exceeds 60 minutes.', 415, { cause: error instanceof Error ? error.message.slice(0, 300) : 'Probe failed' }); }
 }
 
 function safeVideoPath(relativePath: string): string {
@@ -133,6 +158,11 @@ export async function renderVideoWithClips(
   title: string,
   aspectRatio: '16:9' | '9:16' | '1:1' = '16:9',
   resolution: 720 | 1080 = 720,
+  musicTracks: Array<{ storagePath: string; volume: number; startSeconds: number; endSeconds: number | null; outputStartSeconds: number; fadeInSeconds: number; fadeOutSeconds: number; durationSeconds: number }> = [],
+  voiceVolume = 1,
+  timedWords: TranscriptionSegment[] = [],
+  subtitleStyle?: SubtitleStyle,
+  editEvents: EpisodeEditEvent[] = [],
 ): Promise<{ storagePath: string; sizeBytes: number }> {
   if (clipStoragePaths.length === 0) {
     throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'Select at least one video clip.', 400);
@@ -182,18 +212,110 @@ export async function renderVideoWithClips(
     const concatList = join(workDir, 'clips.txt');
     const escapedPaths = normalizedPaths.map((path) => `file '${path.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`);
     await writeFile(concatList, `${escapedPaths.join('\n')}\n`, 'utf8');
+    const musicPaths = await Promise.all(musicTracks.map((track) => resolveMusicPath(track.storagePath)));
     const args = ['-y', '-stream_loop', '-1', '-f', 'concat', '-safe', '0', '-i', concatList, '-i', audioPath];
+    for (const musicPath of musicPaths) args.push('-i', musicPath);
     let subtitlePath: string | null = null;
-    if (subtitleContent?.trim() && subtitleFormat) {
+    if ((timedWords.length || editEvents.some((event) => event.enabled && ['typography','sticker'].includes(event.track))) && subtitleStyle) {
+      const assColor = (hex: string, alpha = '00') => `&H${alpha}${hex.replace('#','').match(/.{2}/g)?.reverse().join('') ?? 'FFFFFF'}`;
+      const align = (subtitleStyle.position === 'top' ? 7 : subtitleStyle.position === 'center' ? 4 : 1) + (subtitleStyle.alignment === 'left' ? 0 : subtitleStyle.alignment === 'right' ? 2 : 1);
+      const primary = assColor(subtitleStyle.animation === 'word' ? subtitleStyle.textColor : subtitleStyle.highlightColor); const secondary = assColor(subtitleStyle.textColor);
+      const fontWeight = ['bold','extra-bold'].includes(subtitleStyle.fontWeight) ? -1 : 0;
+      const alpha = Math.round((1 - subtitleStyle.backgroundOpacity) * 255).toString(16).padStart(2,'0');
+      const header = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${width}\nPlayResY: ${height}\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,${subtitleStyle.fontFamily},${subtitleStyle.fontSize},${primary},${secondary},${assColor(subtitleStyle.outlineColor)},${assColor(subtitleStyle.backgroundColor,alpha)},${fontWeight},0,${subtitleStyle.backgroundOpacity > 0 ? 3 : 1},${subtitleStyle.outlineWidth},${subtitleStyle.shadow},${align},54,54,${subtitleStyle.position === 'top' ? 70 : 64},1\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n`;
+      const stamp = (n: number) => { const cs = Math.max(0, Math.floor(n * 100)); return `${String(Math.floor(cs / 360000)).padStart(1,'0')}:${String(Math.floor(cs / 6000) % 60).padStart(2,'0')}:${String(Math.floor(cs / 100) % 60).padStart(2,'0')}.${String(cs % 100).padStart(2,'0')}`; };
+      const chunks: TranscriptionSegment[][] = [];
+      if (['karaoke','smooth','typewriter','edit','stagger'].includes(subtitleStyle.animation)) {
+        for (let index=0; index<timedWords.length; index+=5) chunks.push(timedWords.slice(index,index+5));
+      } else timedWords.forEach((word) => chunks.push([word]));
+      const captionEvents = chunks.flatMap((words) => {
+        const valid = words.map((word) => ({ ...word, text: word.text.replace(/[{}\\]/g,'').trim() })).filter((word) => word.text);
+        if (!valid.length) return [];
+        const intensity = subtitleStyle.intensity ?? 'balanced';
+        const punch = intensity === 'creative' ? 140 : intensity === 'subtle' ? 112 : 126;
+        const emphasisScale = intensity === 'creative' ? 148 : intensity === 'subtle' ? 112 : 130;
+        const fxByAnimation: Record<string, string> = {
+          fade: '\\fad(140,120)', 'fade-out': '\\fad(0,240)', pop: `\\fscx65\\fscy65\\t(0,130,\\fscx${punch}\\fscy${punch})\\t(130,260,\\fscx100\\fscy100)`,
+          'pop-out': `\\t(0,120,\\fscx115\\fscy115)\\t(180,300,\\fscx0\\fscy0)`, bounce: `\\fscx75\\fscy75\\t(0,180,\\fscx${punch}\\fscy${punch})\\t(180,340,\\fscx100\\fscy100)`,
+          'scale-punch': `\\fscx85\\fscy85\\t(0,100,\\fscx${punch}\\fscy${punch})\\t(100,220,\\fscx100\\fscy100)`, slide: '\\fscx75\\t(0,180,\\fscx100)', shake: '\\frz-3\\t(0,70,\\frz4)\\t(70,140,\\frz-3)\\t(140,230,\\frz0)',
+          elastic: `\\fscx60\\fscy60\\t(0,150,\\fscx${punch + 12}\\fscy${punch + 12})\\t(150,300,\\fscx100\\fscy100)`, glitch: '\\fsp5\\1c&H00FFFF&\\t(80,180,\\fsp0\\1c&H00FFFFFF&)',
+          rotation: '\\frz12\\t(0,220,\\frz0)', blur: '\\blur5\\t(0,240,\\blur0)', wave: '\\frz-3\\t(0,180,\\frz3)\\t(180,360,\\frz0)', tracking: '\\fsp8\\t(0,220,\\fsp0)',
+        };
+        const fx = fxByAnimation[subtitleStyle.animation] ?? '';
+        const karaoke = ['karaoke','smooth','edit','stagger'].includes(subtitleStyle.animation);
+        const spacing = subtitleStyle.letterSpacing ? `\\fsp${subtitleStyle.letterSpacing}` : '';
+        if (subtitleStyle.animation === 'typewriter') return valid.map((word,index) => {
+          const end = index+1<valid.length ? Math.max(word.end,valid[index+1].start) : word.end;
+          const text = valid.slice(0,index+1).map((part)=>part.text).join(' ');
+          return `Dialogue: 0,${stamp(word.start)},${stamp(Math.max(end,word.start+0.05))},Default,,0,0,0,,{${spacing}}${text}`;
+        });
+        const text = valid.map((word) => {
+          const duration = Math.max(1,Math.round((word.end-word.start)*100));
+          if (subtitleStyle.animation !== 'edit') {
+            const timing = karaoke ? `{\\${subtitleStyle.animation === 'smooth' ? 'kf' : 'k'}${duration}}` : '';
+            if (subtitleStyle.animation === 'stagger') return `${timing}{\\t(0,${Math.min(280, valid.indexOf(word) * 55)},\\fscx${punch}\\fscy${punch})}${word.text}{\\fscx100\\fscy100}`;
+            return `${timing}${word.text}`;
+          }
+          const emphatic = /[!?！？]{1,}$/.test(word.text) || (word.text.length > 2 && word.text === word.text.toLocaleUpperCase() && /[\\p{L}]/u.test(word.text));
+          const marker = /[!?！？]{2,}$/.test(word.text) ? ' ‼' : /[?？]$/.test(word.text) ? ' ?' : /[!！]$/.test(word.text) ? ' ✦' : '';
+          const base = word.text;
+          const timed = `{\\k${duration}}`;
+          return emphatic
+            ? `${timed}{\\fscx${emphasisScale}\\fscy${emphasisScale}\\bord${subtitleStyle.outlineWidth + 1}\\1c${primary}}${base}${marker}{\\fscx100\\fscy100\\bord${subtitleStyle.outlineWidth}}`
+            : `${timed}${word.text}`;
+        }).join(' ');
+        return [`Dialogue: 0,${stamp(valid[0].start)},${stamp(Math.max(valid[valid.length-1].end, valid[0].start + 0.05))},Default,,0,0,0,,{${fx}${spacing}}${text}`];
+      }).filter(Boolean).join('\n');
+      const overlayEvents = editEvents.filter((event) => event.enabled && ['typography','sticker'].includes(event.track) && event.text.trim()).map((event) => {
+        const y = event.position === 'top' ? Math.round(height * 0.2) : event.position === 'bottom' ? Math.round(height * 0.78) : Math.round(height * 0.5);
+        const size = Math.max(24, Math.min(220, Math.round(subtitleStyle.fontSize * event.scale)));
+        const alpha = Math.round((1 - event.opacity) * 255).toString(16).padStart(2,'0');
+        const animation = event.animation === 'bounce' ? `\\fscx70\\fscy70\\t(0,180,\\fscx120\\fscy120)\\t(180,320,\\fscx100\\fscy100)`
+          : event.animation === 'shake' ? '\\frz-5\\t(0,80,\\frz5)\\t(80,160,\\frz-3)\\t(160,240,\\frz0)'
+            : event.animation === 'slide' ? '\\fscx75\\t(0,180,\\fscx100)' : `\\fscx65\\fscy65\\t(0,140,\\fscx110\\fscy110)\\t(140,260,\\fscx100\\fscy100)`;
+        const overlayText = event.text.replace(/[{}\\]/g, '').replace(/\r?\n/g, '\\N').slice(0,160);
+        return `Dialogue: 1,${stamp(event.startSeconds)},${stamp(Math.max(event.endSeconds,event.startSeconds+0.08))},Default,,0,0,0,,{\\an5\\pos(${Math.round(width/2)},${y})\\fs${size}\\alpha&H${alpha}&\\bord${Math.max(2,subtitleStyle.outlineWidth+1)}\\1c${primary}${animation}}${overlayText}`;
+      });
+      const events = [captionEvents, ...overlayEvents].filter(Boolean).join('\n');
+      subtitlePath = join(workDir, 'captions.ass');
+      await writeFile(subtitlePath, `${header}${events}\n`, 'utf8');
+    } else if (subtitleContent?.trim() && subtitleFormat) {
       subtitlePath = join(workDir, `captions.${subtitleFormat}`);
       await writeFile(subtitlePath, subtitleContent, 'utf8');
-      args.push('-i', subtitlePath);
     }
-    const videoFilter = `fps=30,${fitFilter}`
-      + (subtitlePath ? `,subtitles=captions.${subtitleFormat}` : '');
+    if (subtitlePath) args.push('-i', subtitlePath);
+    const presetFilter = subtitleStyle?.preset === 'cinematic' ? ',eq=contrast=1.06:saturation=0.88,vignette=PI/5'
+      : ['tiktok','energetic'].includes(subtitleStyle?.preset ?? '') ? ',eq=contrast=1.08:saturation=1.2'
+        : subtitleStyle?.preset === 'meme' ? ',eq=contrast=1.1:saturation=1.12' : '';
+    const eventVideoFilters = editEvents.filter((event) => event.enabled && event.track === 'visual-effect').flatMap((event) => {
+      const interval = `:enable='between(t,${event.startSeconds},${event.endSeconds})'`;
+      if (event.effect === 'flash') return [`eq=brightness=${Math.min(0.8,0.25*event.scale)}${interval}`];
+      if (event.effect === 'vignette') return [`vignette=PI/${Math.max(2,Math.round(8/event.scale))}${interval}`];
+      if (event.effect === 'soft-blur') return [`gblur=sigma=${Math.min(8,event.scale*2)}${interval}`];
+      if (event.effect === 'contrast') return [`eq=contrast=${Math.min(1.8,1+event.scale*0.2)}${interval}`];
+      return [];
+    }).join(',');
+    const videoFilter = `fps=30,${fitFilter}${presetFilter}${eventVideoFilters ? `,${eventVideoFilters}` : ''}`
+      + (subtitlePath ? `,subtitles=captions.${extname(subtitlePath).slice(1)}` : '');
+    let audioFilter: string | null = null;
+    if (musicTracks.length || voiceVolume !== 1) {
+      const filters: string[] = [`[1:a]volume=${Math.max(0, Math.min(2, voiceVolume))}[voice]`];
+      const mixInputs = ['[voice]'];
+      musicTracks.forEach((track, index) => {
+        const start = Math.max(0, track.startSeconds);
+        const end = track.endSeconds && track.endSeconds > start ? `:end=${track.endSeconds}` : '';
+        const delay = Math.max(0, Math.round(track.outputStartSeconds * 1000));
+        const duration = Math.max(0, (track.endSeconds ?? track.durationSeconds) - start);
+        const fades = `${track.fadeInSeconds > 0 ? `,afade=t=in:st=0:d=${Math.min(track.fadeInSeconds,duration)}` : ''}${track.fadeOutSeconds > 0 ? `,afade=t=out:st=${Math.max(0,duration-track.fadeOutSeconds)}:d=${Math.min(track.fadeOutSeconds,duration)}` : ''}`;
+        filters.push(`[${index + 2}:a]atrim=start=${start}${end},asetpts=PTS-STARTPTS,volume=${Math.max(0, Math.min(2, track.volume))}${fades},adelay=${delay}|${delay}[music${index}]`);
+        mixInputs.push(`[music${index}]`);
+      });
+      filters.push(`${mixInputs.join('')}amix=inputs=${mixInputs.length}:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.95,atrim=duration=${audioDurationSeconds}[aout]`);
+      audioFilter = filters.join(';');
+    }
     args.push(
-      '-map', '0:v:0', '-map', '1:a:0',
-      ...(subtitlePath ? ['-map', '2:s:0'] : []),
+      '-map', '0:v:0', ...(audioFilter ? ['-filter_complex', audioFilter, '-map', '[aout]'] : ['-map', '1:a:0']),
+      ...(subtitlePath ? ['-map', `${musicPaths.length + 2}:s:0`] : []),
       '-vf', videoFilter,
       '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
       '-c:a', 'aac', '-b:a', '192k',
@@ -417,11 +539,12 @@ async function runFfmpeg(command: string, args: string[], timeout: number, cwd?:
   } catch (error) {
     const timeoutError = error as NodeJS.ErrnoException;
     const isTimeout = timeoutError.code === 'ETIMEDOUT';
+    const stderr = typeof (error as { stderr?: unknown }).stderr === 'string' ? (error as { stderr: string }).stderr.trim().slice(-1500) : '';
     throw new AppError(
       isTimeout ? ERROR_CODES.FFMPEG_TIMEOUT : ERROR_CODES.FFMPEG_FAILED,
       isTimeout ? 'FFmpeg exceeded its configured processing time limit.' : 'FFmpeg failed to process the media file.',
       500,
-      { cause: error instanceof Error ? error.message.slice(0, 1000) : 'Unknown FFmpeg failure.' },
+      { cause: stderr || (error instanceof Error ? error.message.slice(0, 1000) : 'Unknown FFmpeg failure.') },
     );
   }
 }

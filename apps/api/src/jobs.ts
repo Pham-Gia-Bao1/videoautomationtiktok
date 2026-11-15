@@ -232,6 +232,9 @@ export function startVideoRender(videoId: string): void {
           });
         }
         if (!video.ghostStyle) throw new AppError(ERROR_CODES.VALIDATION_FAILED, 'Choose a Ghost Editor style before rendering.', 422);
+        const editEvents = currentData.editEvents.filter((event) => event.episodeVideoId === video.id);
+        const ghostMusic = (video.musicTracks ?? []).map((track) => { const asset=currentData.musicAssets.find((item)=>item.id===track.musicId&&item.episodeId===video.episodeId); if(!asset)throw new AppError(ERROR_CODES.NOT_FOUND,'A selected background music file is unavailable.',404); return { ...track,storagePath:asset.storagePath,durationSeconds:asset.durationSeconds }; });
+        const ghostEffects = editEvents.filter((event)=>event.enabled&&event.track==='sound-effect').map((event)=>{const asset=currentData.musicAssets.find((item)=>item.id===event.musicAssetId&&item.episodeId===video.episodeId);if(!asset)throw new AppError(ERROR_CODES.NOT_FOUND,'A selected sound effect file is unavailable.',404);return {storagePath:asset.storagePath,volume:event.volume,startSeconds:0,endSeconds:Math.min(asset.durationSeconds,event.endSeconds-event.startSeconds),outputStartSeconds:event.startSeconds,fadeInSeconds:.03,fadeOutSeconds:.12,durationSeconds:asset.durationSeconds};});
         output = await renderGhostEdit({
           audioStoragePath: audio.storagePath,
           clips: selectedClips as NonNullable<(typeof selectedClips)[number]>[],
@@ -242,6 +245,10 @@ export function startVideoRender(videoId: string): void {
           aspectRatio: video.aspectRatio ?? '9:16',
           resolution: video.resolution ?? 1080,
           style: video.ghostStyle as import('./ghost-editor').GhostStyle,
+          musicTracks: [...ghostMusic,...ghostEffects],
+          voiceVolume: video.voiceVolume ?? 1,
+          subtitleStyle: video.subtitleStyle,
+          editEvents,
         });
       } else {
         let clipStoragePaths: string[];
@@ -291,6 +298,18 @@ export function startVideoRender(videoId: string): void {
         if (video.subtitleId && (!subtitle || !['srt', 'vtt'].includes(subtitle.format))) {
           throw new AppError(ERROR_CODES.NOT_FOUND, 'The selected subtitle is unavailable.', 404);
         }
+        const subtitleTranscription = subtitle && data.transcriptions.find((item) => item.id === subtitle.transcriptionId);
+        const music = (video.musicTracks ?? []).map((track) => {
+          const asset = data.musicAssets.find((item) => item.id === track.musicId && item.episodeId === video.episodeId);
+          if (!asset) throw new AppError(ERROR_CODES.NOT_FOUND, 'One of the selected background music files is unavailable.', 404);
+          return { ...track, storagePath: asset.storagePath, durationSeconds: asset.durationSeconds };
+        });
+        const editEvents = data.editEvents.filter((event) => event.episodeVideoId === video.id);
+        const soundEffects = editEvents.filter((event) => event.enabled && event.track === 'sound-effect').map((event) => {
+          const asset = data.musicAssets.find((item) => item.id === event.musicAssetId && item.episodeId === video.episodeId);
+          if (!asset) throw new AppError(ERROR_CODES.NOT_FOUND, 'One of the selected sound effect files is unavailable.', 404);
+          return { storagePath: asset.storagePath, volume: event.volume, startSeconds: 0, endSeconds: Math.min(asset.durationSeconds, event.endSeconds - event.startSeconds), outputStartSeconds: event.startSeconds, fadeInSeconds: 0.03, fadeOutSeconds: 0.12, durationSeconds: asset.durationSeconds };
+        });
         output = await renderVideoWithClips(
           audio.storagePath,
           clipStoragePaths,
@@ -300,6 +319,11 @@ export function startVideoRender(videoId: string): void {
           video.title,
           video.aspectRatio,
           video.resolution,
+          [...music, ...soundEffects],
+          video.voiceVolume ?? 1,
+          subtitleTranscription?.segments ?? [],
+          video.subtitleStyle,
+          editEvents,
         );
       }
       await updateData((current) => {

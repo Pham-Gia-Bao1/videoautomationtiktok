@@ -1,5 +1,5 @@
 import { AppError, ERROR_CODES } from '@podcast/core';
-import type { TranscriptionSegment, VideoClip } from '@podcast/types';
+import type { EpisodeEditEvent, SubtitleStyle, TranscriptionSegment, VideoClip } from '@podcast/types';
 import { execFile, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { resolveProjectPath } from './paths';
-import { probeVideoClip, resolveAudioPath, resolveVideoPath, storeRenderedVideoFile } from './media';
+import { probeVideoClip, resolveAudioPath, resolveMusicPath, resolveVideoPath, storeRenderedVideoFile } from './media';
 
 const execFileAsync = promisify(execFile);
 const ghostRoot = resolveProjectPath(process.env.GHOST_EDITOR_PATH ?? 'integrations/ghost-editor');
@@ -201,7 +201,39 @@ function assText(value: string): string {
   return value.replace(/[\\{}]/g, '\\$&').replace(/\r?\n/g, ' ');
 }
 
-function makeAss(segments: TranscriptionSegment[], style: GhostStyle, preset: Record<string, any>): string {
+function makeAss(segments: TranscriptionSegment[], style: GhostStyle, preset: Record<string, any>, custom?: SubtitleStyle, editEvents: EpisodeEditEvent[] = []): string {
+  if (custom) {
+    const align = (custom.position==='top'?7:custom.position==='center'?4:1)+(custom.alignment==='left'?0:custom.alignment==='right'?2:1);
+    const alpha=Math.round((1-custom.backgroundOpacity)*255).toString(16).padStart(2,'0');
+    const bold=['bold','extra-bold'].includes(custom.fontWeight)?-1:0;
+    const bg=assColor(custom.backgroundColor).replace('&H','&H'+alpha);
+    const border=custom.backgroundOpacity>0?3:1;
+    const ordered=segments.filter((word)=>word.text.trim()&&word.end>word.start).slice().sort((a,b)=>a.start-b.start);
+    const groups:TranscriptionSegment[][]=[];
+    if(['karaoke','smooth','typewriter','edit','stagger'].includes(custom.animation)){for(let i=0;i<ordered.length;i+=5)groups.push(ordered.slice(i,i+5));}else ordered.forEach((word)=>groups.push([word]));
+    const events=groups.flatMap((group)=>{
+      const words=group.map((word)=>({...word,text:assText(word.text.trim())}));
+      if(custom.animation==='typewriter')return words.map((word,index)=>`Dialogue: 0,${assTime(word.start)},${assTime(Math.max(index+1<words.length?words[index+1].start:word.end,word.start+0.05))},Custom,,0,0,0,,{\\fsp${custom.letterSpacing}}${words.slice(0,index+1).map((part)=>part.text).join(' ')}`);
+      const intensity=custom.intensity??'balanced';const punch=intensity==='creative'?140:intensity==='subtle'?112:126;const emphasisScale=intensity==='creative'?148:intensity==='subtle'?112:130;
+      const fxByAnimation:Record<string,string>={fade:'\\fad(140,120)','fade-out':'\\fad(0,240)',pop:`\\fscx65\\fscy65\\t(0,130,\\fscx${punch}\\fscy${punch})\\t(130,260,\\fscx100\\fscy100)`,'pop-out':'\\t(0,120,\\fscx115\\fscy115)\\t(180,300,\\fscx0\\fscy0)',bounce:`\\fscx75\\fscy75\\t(0,180,\\fscx${punch}\\fscy${punch})\\t(180,340,\\fscx100\\fscy100)`,'scale-punch':`\\fscx85\\fscy85\\t(0,100,\\fscx${punch}\\fscy${punch})\\t(100,220,\\fscx100\\fscy100)`,slide:'\\fscx75\\t(0,180,\\fscx100)',shake:'\\frz-3\\t(0,70,\\frz4)\\t(70,140,\\frz-3)\\t(140,230,\\frz0)',elastic:`\\fscx60\\fscy60\\t(0,150,\\fscx${punch+12}\\fscy${punch+12})\\t(150,300,\\fscx100\\fscy100)`,glitch:'\\fsp5\\1c&H00FFFF&\\t(80,180,\\fsp0\\1c&H00FFFFFF&)',rotation:'\\frz12\\t(0,220,\\frz0)',blur:'\\blur5\\t(0,240,\\blur0)',wave:'\\frz-3\\t(0,180,\\frz3)\\t(180,360,\\frz0)',tracking:'\\fsp8\\t(0,220,\\fsp0)'};
+      const fx=fxByAnimation[custom.animation]??'';
+      const text=words.map((word)=>{
+        const duration=Math.max(1,Math.round((word.end-word.start)*100));
+        if(custom.animation==='edit'){
+          const emphatic=/[!?！？]{1,}$/.test(word.text)||(word.text.length>2&&word.text===word.text.toLocaleUpperCase()&&/[\\p{L}]/u.test(word.text));
+          const marker=/[!?！？]{2,}$/.test(word.text)?' ‼':/[?？]$/.test(word.text)?' ?':/[!！]$/.test(word.text)?' ✦':'';
+          return emphatic?`{\\k${duration}}{\\fscx${emphasisScale}\\fscy${emphasisScale}\\bord${custom.outlineWidth+1}\\1c${assColor(custom.highlightColor)}}${word.text}${marker}{\\fscx100\\fscy100\\bord${custom.outlineWidth}}`:`{\\k${duration}}${word.text}`;
+        }
+        const timed=['karaoke','smooth','stagger'].includes(custom.animation)?`{\\${custom.animation==='smooth'?'kf':'k'}${duration}}`:'';
+        if(custom.animation==='stagger')return `${timed}{\\t(0,${Math.min(280,words.indexOf(word)*55)},\\fscx${punch}\\fscy${punch})}${word.text}{\\fscx100\\fscy100}`;
+        return `${timed}${word.text}`;
+      }).join(' ');
+      return [`Dialogue: 0,${assTime(words[0].start)},${assTime(Math.max(words.at(-1)!.end,words[0].start+0.05))},Custom,,0,0,0,,{${fx}\\fsp${custom.letterSpacing}}${text}`];
+    });
+    const primaryColor=custom.animation==='word'?custom.textColor:custom.highlightColor;
+    const overlays=editEvents.filter((event)=>event.enabled&&['typography','sticker'].includes(event.track)&&event.text.trim()).map((event)=>{const y=event.position==='top'?380:event.position==='bottom'?1500:960;const size=Math.max(24,Math.min(220,Math.round(custom.fontSize*event.scale)));const alpha=Math.round((1-event.opacity)*255).toString(16).padStart(2,'0');const fx=event.animation==='shake'?'\\frz-5\\t(0,80,\\frz5)\\t(80,160,\\frz-3)\\t(160,240,\\frz0)':event.animation==='slide'?'\\fscx75\\t(0,180,\\fscx100)':'\\fscx65\\fscy65\\t(0,140,\\fscx110\\fscy110)\\t(140,260,\\fscx100\\fscy100)';const text=assText(event.text).replace(/\\n/g,'\\N');return `Dialogue: 1,${assTime(event.startSeconds)},${assTime(Math.max(event.endSeconds,event.startSeconds+0.08))},Custom,,0,0,0,,{\\an5\\pos(540,${y})\\fs${size}\\alpha&H${alpha}&\\bord${custom.outlineWidth+1}\\1c${assColor(custom.highlightColor)}${fx}}${text}`;});
+    return ['[Script Info]','ScriptType: v4.00+','WrapStyle: 2','ScaledBorderAndShadow: yes','PlayResX: 1080','PlayResY: 1920','','[V4+ Styles]','Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',`Style: Custom,${custom.fontFamily},${custom.fontSize},${assColor(primaryColor)},${assColor(custom.textColor)},${assColor(custom.outlineColor)},${bg},${bold},0,0,0,100,100,${custom.letterSpacing},0,${border},${custom.outlineWidth},${custom.shadow},${align},55,55,${custom.position==='top'?70:64},1`,'','[Events]','Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',...events,...overlays,''].join('\n');
+  }
   const brand = preset.brand ?? {};
   const captions = preset.captions ?? {};
   const fontSize = Number(brand.capSize ?? 60);
@@ -263,6 +295,10 @@ export async function renderGhostEdit(input: {
   aspectRatio: '16:9' | '9:16' | '1:1';
   resolution: 720 | 1080;
   style: GhostStyle;
+  musicTracks?: Array<{ storagePath:string; volume:number; startSeconds:number; endSeconds:number|null; outputStartSeconds:number; fadeInSeconds:number; fadeOutSeconds:number; durationSeconds:number }>;
+  voiceVolume?: number;
+  subtitleStyle?: SubtitleStyle;
+  editEvents?: EpisodeEditEvent[];
 }): Promise<{ storagePath: string; sizeBytes: number; note?: string }> {
   const stylePath = join(ghostRoot, 'styles', `${input.style}.json`);
   if (!existsSync(stylePath)) throw new AppError(ERROR_CODES.INTERNAL, `Ghost Editor style '${input.style}' is missing.`, 500);
@@ -318,16 +354,32 @@ export async function renderGhostEdit(input: {
     const escaped = normalized.map((path) => `file '${path.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`);
     await writeFile(concatList, `${escaped.join('\n')}\n`, 'utf8');
     const assPath = join(workDir, 'captions.ass');
-    await writeFile(assPath, makeAss(input.segments, input.style, preset), 'utf8');
+    await writeFile(assPath, makeAss(input.segments, input.style, preset, input.subtitleStyle, input.editEvents), 'utf8');
     const output = join(workDir, 'reel.mp4');
     const filterPath = assPath.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
-    const filter = `subtitles='${filterPath}'`;
-    await execFileAsync(process.env.FFMPEG_PATH ?? 'ffmpeg', [
+    const visualEffects=(input.editEvents??[]).filter((event)=>event.enabled&&event.track==='visual-effect').flatMap((event)=>{const interval=`:enable='between(t,${event.startSeconds},${event.endSeconds})'`;if(event.effect==='flash')return [`eq=brightness=${Math.min(.8,.25*event.scale)}${interval}`];if(event.effect==='vignette')return [`vignette=PI/${Math.max(2,Math.round(8/event.scale))}${interval}`];if(event.effect==='soft-blur')return [`gblur=sigma=${Math.min(8,event.scale*2)}${interval}`];if(event.effect==='contrast')return [`eq=contrast=${Math.min(1.8,1+event.scale*.2)}${interval}`];return [];}).join(',');
+    const filter = `${visualEffects ? `${visualEffects},` : ''}subtitles='${filterPath}'`;
+    const musicPaths=await Promise.all((input.musicTracks??[]).map((track)=>resolveMusicPath(track.storagePath)));
+    const ffmpegArgs=[
       '-hide_banner', '-loglevel', 'error', '-y', '-stream_loop', '-1', '-f', 'concat', '-safe', '0', '-i', concatList,
-      '-i', audioPath, '-vf', filter, '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'libx264', '-preset', 'veryfast',
+      '-i', audioPath,
+    ];
+    for(const path of musicPaths)ffmpegArgs.push('-i',path);
+    const voiceVolume=Math.max(0,Math.min(2,input.voiceVolume??1));
+    if(musicPaths.length||voiceVolume!==1){
+      const mix=['[voice]'];const filters=[`[1:a]volume=${voiceVolume}[voice]`];
+      (input.musicTracks??[]).forEach((track,index)=>{
+        const start=Math.max(0,track.startSeconds);const end=track.endSeconds&&track.endSeconds>start?`:end=${track.endSeconds}`:'';const delay=Math.round(Math.max(0,track.outputStartSeconds)*1000);const duration=Math.max(0,(track.endSeconds??track.durationSeconds)-start);
+        const fades=`${track.fadeInSeconds?`,afade=t=in:st=0:d=${Math.min(duration,track.fadeInSeconds)}`:''}${track.fadeOutSeconds?`,afade=t=out:st=${Math.max(0,duration-track.fadeOutSeconds)}:d=${Math.min(duration,track.fadeOutSeconds)}`:''}`;
+        filters.push(`[${index+2}:a]atrim=start=${start}${end},asetpts=PTS-STARTPTS,volume=${Math.max(0,Math.min(2,track.volume))}${fades},adelay=${delay}|${delay}[music${index}]`);mix.push(`[music${index}]`);
+      });
+      filters.push(`${mix.join('')}amix=inputs=${mix.length}:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.95,atrim=duration=${audioDuration}[aout]`);
+      ffmpegArgs.push('-filter_complex',filters.join(';'),'-map','[aout]');
+    }else ffmpegArgs.push('-map','1:a:0');
+    ffmpegArgs.push('-vf', filter, '-map', '0:v:0', '-c:v', 'libx264', '-preset', 'veryfast',
       '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-t', audioDuration.toFixed(3), '-movflags', '+faststart',
-      '-metadata', `title=${input.title}`, output,
-    ], { timeout: Number(process.env.FFMPEG_VIDEO_TIMEOUT_MS ?? 1_800_000), maxBuffer: 1024 * 1024, cwd: workDir });
+      '-metadata', `title=${input.title}`, output);
+    await execFileAsync(process.env.FFMPEG_PATH ?? 'ffmpeg',ffmpegArgs,{ timeout: Number(process.env.FFMPEG_VIDEO_TIMEOUT_MS ?? 1_800_000), maxBuffer: 1024 * 1024, cwd: workDir });
 
     const stored = await storeRenderedVideoFile(input.videoId, output);
     return { ...stored, note: plan.note };
