@@ -1,0 +1,18 @@
+node_modules/
+dist/
+next-env.d.ts
+.next/
+out/
+*.log
+.env
+.env.local
+.env*.local
+
+# Local data store & generated media
+data/
+storage/
+tmp/
+
+# OS
+.DS_Store
+Thumbs.db
